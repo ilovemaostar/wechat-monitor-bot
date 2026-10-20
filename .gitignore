@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+
+# Virtualenv
+.venv/
+venv/
+ENV/
+
+# Env files
+.env
+.env.*
+
+# Database
+*.db
+*.sqlite3
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Docker
+/docker-data/

@@ -1,0 +1,229 @@
+from __future__ import annotations
+
+from fastapi import FastAPI, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse
+from sqlalchemy import select
+
+from .ai_service import generate_reply
+from .config import settings
+from .database import AsyncSessionLocal, init_db
+from .models import MessageRecord, ReplyRule
+from .redis_client import publish_message
+from .schemas import ReplyRuleCreate, ReplyRuleRead, ReplyTestRequest, ReplyTestResponse
+from .wecom_service import extract_message_data, send_text_message, verify_wechat_signature
+
+app = FastAPI(title=settings.app_name, debug=settings.debug)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+async def startup_event():
+    await init_db()
+    async with AsyncSessionLocal() as session:
+        existing_rules = (await session.execute(select(ReplyRule))).scalars().all()
+        if not existing_rules:
+            session.add_all(
+                [
+                    ReplyRule(
+                        name="欢迎词",
+                        keyword="你好",
+                        response_template="您好！欢迎咨询，我们会尽快为您服务。",
+                        active=True,
+                    ),
+                    ReplyRule(
+                        name="价格咨询",
+                        keyword="价格",
+                        response_template="请提供需求类型、数量和交付时间，我将为您给出参考报价。",
+                        active=True,
+                    ),
+                    ReplyRule(
+                        name="售后问题",
+                        keyword="售后",
+                        response_template="我们已经记录您的问题，请说明故障现象和出现时间，我们会尽快处理。",
+                        active=True,
+                    ),
+                ]
+            )
+            await session.commit()
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": settings.app_name}
+
+
+@app.get("/wechat/callback")
+async def wechat_get_callback(
+    signature: str = Query(None),
+    timestamp: str = Query(None),
+    nonce: str = Query(None),
+    echostr: str = Query(None),
+):
+    if not all([signature, timestamp, nonce, echostr]):
+        return JSONResponse({"error": "missing callback params"}, status_code=400)
+
+    if not verify_wechat_signature(timestamp, nonce, signature):
+        return PlainTextResponse("invalid signature", status_code=403)
+
+    return PlainTextResponse(echostr)
+
+
+@app.post("/wechat/callback")
+async def wechat_post_callback(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    if not payload:
+        return JSONResponse({"ok": True, "message": "empty payload"})
+
+    msg_type, content, from_user = extract_message_data(payload)
+
+    if str(msg_type).lower() != "text":
+        return JSONResponse({"ok": True, "message": "ignored message type"})
+
+    if not content:
+        return JSONResponse({"ok": True, "message": "empty content"})
+
+    async with AsyncSessionLocal() as session:
+        rule = (
+            await session.execute(
+                select(ReplyRule)
+                .where(ReplyRule.active.is_(True))
+                .order_by(ReplyRule.created_at.desc())
+            )
+        ).scalars().all()
+
+        matched_reply = None
+        for item in rule:
+            if item.keyword.lower() in content.lower():
+                matched_reply = item.response_template
+                break
+
+    if matched_reply is None:
+        matched_reply = await generate_reply(content)
+        reply_source = "ai"
+    else:
+        reply_source = "rule"
+
+    async with AsyncSessionLocal() as session:
+        record = MessageRecord(
+            from_user=from_user,
+            content=content,
+            msg_type=str(msg_type),
+            reply_text=matched_reply,
+            source="wechat",
+            session_id=f"session_{from_user}",
+        )
+        session.add(record)
+        await session.commit()
+
+    await publish_message("message_received", {"from_user": from_user, "content": content})
+
+    try:
+        if settings.wechat_agent_id and settings.wechat_secret and settings.wechat_corp_id:
+            send_result = await send_text_message(from_user, matched_reply)
+        else:
+            send_result = {"ok": False, "message": "微信配置未完成"}
+    except Exception as exc:
+        send_result = {"ok": False, "message": str(exc)}
+
+    return JSONResponse({
+        "ok": True,
+        "reply": matched_reply,
+        "source": reply_source,
+        "send_result": send_result,
+    })
+
+
+@app.get("/api/messages")
+async def list_messages(limit: int = 50):
+    async with AsyncSessionLocal() as session:
+        rows = (
+            await session.execute(select(MessageRecord).order_by(MessageRecord.created_at.desc()).limit(limit))
+        ).scalars().all()
+
+    return {
+        "items": [
+            {
+                "id": row.id,
+                "from_user": row.from_user,
+                "content": row.content,
+                "msg_type": row.msg_type,
+                "reply_text": row.reply_text,
+                "source": row.source,
+                "session_id": row.session_id,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.get("/api/rules")
+async def list_rules():
+    async with AsyncSessionLocal() as session:
+        rows = (await session.execute(select(ReplyRule).order_by(ReplyRule.created_at.desc()))).scalars().all()
+
+    return {
+        "items": [
+            {
+                "id": row.id,
+                "name": row.name,
+                "keyword": row.keyword,
+                "response_template": row.response_template,
+                "active": row.active,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.post("/api/rules", response_model=ReplyRuleRead)
+async def create_rule(payload: ReplyRuleCreate):
+    async with AsyncSessionLocal() as session:
+        rule = ReplyRule(
+            name=payload.name,
+            keyword=payload.keyword,
+            response_template=payload.response_template,
+            active=payload.active,
+        )
+        session.add(rule)
+        await session.commit()
+        await session.refresh(rule)
+        return rule
+
+
+@app.post("/api/reply-test", response_model=ReplyTestResponse)
+async def reply_test(payload: ReplyTestRequest):
+    matched_reply = None
+    async with AsyncSessionLocal() as session:
+        rules = (await session.execute(select(ReplyRule).where(ReplyRule.active.is_(True)))).scalars().all()
+        for rule in rules:
+            if rule.keyword.lower() in payload.content.lower():
+                matched_reply = rule.response_template
+                break
+
+    if matched_reply is None:
+        matched_reply = await generate_reply(payload.content)
+        source = "ai"
+    else:
+        source = "rule"
+
+    return ReplyTestResponse(reply=matched_reply, source=source)
+
+
+@app.get("/")
+async def root():
+    return {"message": "WeChat Monitor Bot API"}
